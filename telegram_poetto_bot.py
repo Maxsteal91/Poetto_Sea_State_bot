@@ -13,6 +13,7 @@ import logging
 import shutil
 import datetime
 import pytz
+import gdown
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -20,11 +21,33 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
+
+# TELEGRAM TOKEN
+from pathlib import Path
+
+# Load .env file if exists
+env_path = Path(".env")
+if env_path.exists():
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=env_path)
+    print("Loaded environment variables from .env")
+else:
+    print(".env not found, reading environment variables directly")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("⚠️ TELEGRAM_TOKEN not found! Set it in .env (local) or in environment variables (production)")
+
+print("Telegram token loaded successfully")
+
+
 # CONFIG
-TELEGRAM_TOKEN = "8253440827:AAGj4EPEnfSpUGFPTuyr3T0W-GbXqI9hSTM"
 M3U8_URL = "https://cdn-002.whatsupcams.com/hls/it_cagliari01.m3u8"
 DOWNLOAD_DIR = "./temp"
-MODEL_PATH = "./model/r3d_18_poetto.pth"
+MODEL_DIR = "./model"
+MODEL_PATH = os.path.join(MODEL_DIR, "r3d_18_poetto.pth")
+MODEL_GDRIVE_ID = "1ASd7VdbSrXXs9fa3EpHFed0W2NlUugq9"
 TIMEOUT = 15
 RETRIES = 2
 
@@ -33,7 +56,7 @@ ROI = (430, 600, 430 + 1400, 600 + 350)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 class_names = ["mare_calmo", "mare_mosso"]
 
-# Messaggi casuali
+# Random messages
 MESSAGES_CALM = [
     "🏊 Perfetto per nuotare! Il mare è bellissimo oggi!",
     "☀️ Condizioni ideali! Corri al mare!",
@@ -57,8 +80,38 @@ user_notify_minute = 30
 user_output_format = "frame"
 scheduled_job_id = None
 
-# SETUP MODELLO
+# SETUP DIRECTORIES
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def download_model_from_gdrive():
+    """Download model from Google Drive if not present"""
+    if os.path.exists(MODEL_PATH):
+        log.info(f"Model already exists at {MODEL_PATH}")
+        return True
+    
+    log.info(f"Model not found at {MODEL_PATH}. Downloading from Google Drive...")
+    try:
+        url = f"https://drive.google.com/uc?id={MODEL_GDRIVE_ID}"
+        gdown.download(url, MODEL_PATH, quiet=False)
+        
+        if os.path.exists(MODEL_PATH):
+            log.info("Model downloaded successfully!")
+            return True
+        else:
+            log.error("Model download failed")
+            return False
+    except Exception as e:
+        log.error(f"Error downloading model: {e}")
+        return False
+
+
+# SETUP MODEL
+log.info("Checking model availability...")
+if not download_model_from_gdrive():
+    raise RuntimeError("Failed to download model from Google Drive")
+
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((112, 112)),
@@ -71,20 +124,25 @@ model.fc = nn.Linear(model.fc.in_features, 2)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model = model.to(DEVICE)
 model.eval()
+log.info("Model loaded successfully")
 
-# UTILITY
+
+# UTILITY FUNCTIONS
 def fetch_text(url):
+    """Fetch text content from URL with retries"""
     for attempt in range(RETRIES + 1):
         try:
             r = requests.get(url, timeout=TIMEOUT)
             r.raise_for_status()
             return r.text
         except Exception as e:
-            log.error(f"Errore fetch (tentativo {attempt+1}): {e}")
+            log.error(f"Fetch error (attempt {attempt+1}): {e}")
             time.sleep(1)
     return None
 
+
 def parse_m3u8_for_ts(m3u8_text, base_url):
+    """Parse M3U8 playlist to extract .ts file URLs"""
     lines = [l.strip() for l in m3u8_text.splitlines() if l.strip() and not l.startswith("#")]
     ts_urls = []
     for l in lines:
@@ -92,7 +150,9 @@ def parse_m3u8_for_ts(m3u8_text, base_url):
             ts_urls.append(l if bool(urlparse(l).netloc) else urljoin(base_url, l))
     return ts_urls
 
+
 def download_file(url, out_path):
+    """Download file from URL with retries"""
     for attempt in range(RETRIES + 1):
         try:
             with requests.get(url, stream=True, timeout=TIMEOUT) as r:
@@ -103,11 +163,13 @@ def download_file(url, out_path):
                             f.write(chunk)
             return True
         except Exception as e:
-            log.error(f"Errore download (tentativo {attempt+1}): {e}")
+            log.error(f"Download error (attempt {attempt+1}): {e}")
             time.sleep(1)
     return False
 
+
 def download_video():
+    """Download random video segment from M3U8 stream"""
     text = fetch_text(M3U8_URL)
     if not text:
         return None
@@ -123,11 +185,13 @@ def download_video():
         return out_path
     return None
 
+
 def load_video(video_path, frames_per_clip=FRAME_COUNT, crop_region=ROI):
+    """Load and preprocess video for model inference"""
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames == 0:
-        raise ValueError("Video non leggibile")
+        raise ValueError("Video not readable")
     
     indices = torch.linspace(0, total_frames - 1, frames_per_clip).long().tolist()
     frames = []
@@ -146,7 +210,9 @@ def load_video(video_path, frames_per_clip=FRAME_COUNT, crop_region=ROI):
     frames = torch.stack(frames).permute(1, 0, 2, 3)
     return frames.unsqueeze(0)
 
+
 def predict(video_path):
+    """Run model inference on video"""
     video_tensor = load_video(video_path).to(DEVICE)
     with torch.no_grad():
         outputs = model(video_tensor)
@@ -154,7 +220,9 @@ def predict(video_path):
         pred_class = torch.argmax(probs, dim=1).item()
     return class_names[pred_class], probs[0][pred_class].item()
 
+
 def extract_frame(video_path):
+    """Extract middle frame from video"""
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     mid_frame = total_frames // 2
@@ -170,12 +238,16 @@ def extract_frame(video_path):
     cv2.imwrite(frame_path, frame)
     return frame_path
 
+
 def cleanup_temp():
+    """Clean temporary directory"""
     if os.path.exists(DOWNLOAD_DIR):
         shutil.rmtree(DOWNLOAD_DIR)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+
 def convert_ts_to_mp4(ts_path):
+    """Convert .ts video to .mp4 format"""
     mp4_path = ts_path.replace(".ts", ".mp4")
     log.info(f"Converting {ts_path} to MP4...")
     try:
@@ -190,6 +262,7 @@ def convert_ts_to_mp4(ts_path):
             return mp4_path
         else:
             log.error(f"FFmpeg error: {result.stderr}")
+            # Fallback to OpenCV
             cap = cv2.VideoCapture(ts_path)
             fps = cap.get(cv2.CAP_PROP_FPS) or 30
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -212,40 +285,48 @@ def convert_ts_to_mp4(ts_path):
         log.error(f"Conversion error: {e}")
         return None
 
+
 # TELEGRAM HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
     global user_chat_id
     user_chat_id = update.effective_chat.id
-    log.info(f"Bot avviato da user_id: {user_chat_id}")
+    log.info(f"Bot started by user_id: {user_chat_id}")
     
     await update.message.reply_text(
         "🌊 <b>Sea Monitoring Bot</b>\n\n"
-        "Monitora lo stato del mare in tempo reale.\n\n"
-        "<b>Comandi disponibili:</b>\n"
-        "/inference - Analizza il mare adesso\n"
-        "/settings - Imposta orario notifica automatica\n"
-        "/output - Scegli formato output (frame/video)\n"
-        "/start - Mostra questo messaggio\n\n"
-        f"📊 <b>Stato attuale:</b>\n"
+        "Monitor sea conditions in real-time.\n\n"
+        "<b>Available commands:</b>\n"
+        "/inference - Analyze sea now\n"
+        "/settings - Set automatic notification time\n"
+        "/output - Choose output format (frame/video)\n"
+        "/start - Show this message\n\n"
+        f"📊 <b>Current status:</b>\n"
         f"• Output: {user_output_format.upper()}\n"
-        f"• Notifica fissa: {user_notify_hour:02d}:{user_notify_minute:02d}",
+        f"• Scheduled notification: {user_notify_hour:02d}:{user_notify_minute:02d}",
         parse_mode="HTML"
     )
 
+
 async def inference(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /inference command"""
     global user_chat_id
     user_chat_id = update.effective_chat.id
-    log.info(f"Inferenza richiesta da user_id: {user_chat_id}")
+    log.info(f"Inference requested by user_id: {user_chat_id}")
     await update.message.reply_text("⏳ Downloading and analyzing...")
     await run_inference(context, is_scheduled=False)
 
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /settings command"""
     await update.message.reply_text(
-        f"⏰ Orario attuale: {user_notify_hour:02d}:{user_notify_minute:02d}\n\nInserisci l'ora (0-23):"
+        f"⏰ Current time: {user_notify_hour:02d}:{user_notify_minute:02d}\n\nEnter hour (0-23):"
     )
     context.user_data['setting_mode'] = 'hour'
 
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text input for settings"""
     global user_notify_hour, user_notify_minute, scheduled_job_id
     
     if 'setting_mode' not in context.user_data:
@@ -256,25 +337,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if context.user_data['setting_mode'] == 'hour':
             if not 0 <= value <= 23:
-                await update.message.reply_text("❌ Inserisci un'ora valida (0-23)")
+                await update.message.reply_text("❌ Enter a valid hour (0-23)")
                 return
             user_notify_hour = value
             context.user_data['setting_mode'] = 'minute'
-            await update.message.reply_text(f"✓ Ora: {value:02d}\n\nInserisci i minuti (0-59):")
+            await update.message.reply_text(f"✓ Hour: {value:02d}\n\nEnter minutes (0-59):")
         
         elif context.user_data['setting_mode'] == 'minute':
             if not 0 <= value <= 59:
-                await update.message.reply_text("❌ Inserisci minuti validi (0-59)")
+                await update.message.reply_text("❌ Enter valid minutes (0-59)")
                 return
             user_notify_minute = value
             del context.user_data['setting_mode']
             
-            # Rimuovi tutti i job precedenti
+            # Remove all previous jobs
             for job in context.job_queue.jobs():
                 if job.name == "scheduled_inference":
                     job.schedule_removal()
             
-            # Calcola secondi fino al prossimo orario
+            # Calculate seconds until next scheduled time
             tz = pytz.timezone('Europe/Rome')
             now = datetime.datetime.now(tz)
             next_run = now.replace(hour=user_notify_hour, minute=user_notify_minute, second=0, microsecond=0)
@@ -289,12 +370,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name="scheduled_inference"
             )
             
-            log.info(f"Notifica aggiornata alle {user_notify_hour:02d}:{user_notify_minute:02d} (ora italiana)")
-            await update.message.reply_text(f"✓ Notifica fissa aggiornata alle {user_notify_hour:02d}:{user_notify_minute:02d}\n\n📅 La prossima notifica arriverà a quell'orario.")
+            log.info(f"Notification updated to {user_notify_hour:02d}:{user_notify_minute:02d} (Italian time)")
+            await update.message.reply_text(f"✓ Scheduled notification updated to {user_notify_hour:02d}:{user_notify_minute:02d}\n\n📅 Next notification will arrive at that time.")
     except ValueError:
-        await update.message.reply_text("❌ Inserisci un numero valido")
+        await update.message.reply_text("❌ Enter a valid number")
+
 
 async def output_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /output command"""
     global user_output_format
     keyboard = [
         [InlineKeyboardButton("🖼️ Frame", callback_data="output_frame")],
@@ -302,12 +385,14 @@ async def output_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Output attuale: <b>{user_output_format.upper()}</b>\n\nScegli formato:",
+        f"Current output: <b>{user_output_format.upper()}</b>\n\nChoose format:",
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
 
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard callbacks"""
     global user_output_format
     query = update.callback_query
     await query.answer()
@@ -322,8 +407,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="⏳ Analyzing...")
         await run_inference(context, is_scheduled=False)
 
-# INFERENZA
+
+# INFERENCE
 async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
+    """Run complete inference pipeline"""
     try:
         log.info("Starting video download...")
         video_path = download_video()
@@ -336,13 +423,13 @@ async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
         pred, prob = predict(video_path)
         log.info(f"Inference complete: {pred} ({prob*100:.1f}%)")
         
-        # Scegli messaggio random
+        # Choose random message
         if "calmo" in pred.lower():
             random_msg = random.choice(MESSAGES_CALM)
         else:
             random_msg = random.choice(MESSAGES_ROUGH)
         
-        message = f"🌊 <b>Spiaggia Poetto - Cagliari</b>\n\n<b>{pred.upper()}</b>\n{prob*100:.1f}% confidence\n\n{random_msg}\n\n⏰ Prossima notifica: {user_notify_hour:02d}:{user_notify_minute:02d}"
+        message = f"🌊 <b>Spiaggia Poetto - Cagliari</b>\n\n<b>{pred.upper()}</b>\n{prob*100:.1f}% confidence\n\n{random_msg}\n\n⏰ Next notification: {user_notify_hour:02d}:{user_notify_minute:02d}"
         
         if user_output_format == "frame":
             frame_path = extract_frame(video_path)
@@ -356,12 +443,12 @@ async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
             else:
                 await context.bot.send_message(chat_id=user_chat_id, text="❌ Error: Failed to convert video")
         
-        # Aggiungi pulsante per inferenza immediata
+        # Add button for immediate inference
         if not is_scheduled:
-            keyboard = [[InlineKeyboardButton("🔄 Inferenza ora", callback_data="inference_now")]]
+            keyboard = [[InlineKeyboardButton("🔄 Analyze again", callback_data="inference_now")]]
             await context.bot.send_message(
                 chat_id=user_chat_id,
-                text="Vuoi fare un'altra analisi?",
+                text="Want to run another analysis?",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
     except Exception as e:
@@ -371,15 +458,18 @@ async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
         log.info("Cleaning temp folder...")
         cleanup_temp()
 
-# JOB PERIODICO
+
+# SCHEDULED JOB
 async def scheduled_inference(context: ContextTypes.DEFAULT_TYPE):
+    """Run inference at scheduled time"""
     if user_chat_id:
-        log.info(f"Notifica automatica alle {user_notify_hour:02d}:{user_notify_minute:02d}")
+        log.info(f"Automatic notification at {user_notify_hour:02d}:{user_notify_minute:02d}")
         await run_inference(context, is_scheduled=True)
+
 
 # MAIN
 if __name__ == "__main__":
-    log.info("Avvio bot Telegram...")
+    log.info("Starting Telegram bot...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -389,7 +479,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Job queue per notifiche a orario fisso
+    # Job queue for scheduled notifications
     job_queue = app.job_queue
     if job_queue:
         tz = pytz.timezone('Europe/Rome')
@@ -405,9 +495,9 @@ if __name__ == "__main__":
             first=delay,
             name="scheduled_inference"
         )
-        log.info(f"✓ Job scheduler configurato: notifica alle {user_notify_hour:02d}:{user_notify_minute:02d} (ora italiana)")
+        log.info(f"✓ Job scheduler configured: notification at {user_notify_hour:02d}:{user_notify_minute:02d} (Italian time)")
     else:
-        log.warning("Job queue non disponibile. Installa con: pip install python-telegram-bot[job-queue]")
+        log.warning("Job queue not available. Install with: pip install python-telegram-bot[job-queue]")
     
-    log.info("✓ Bot in esecuzione. In attesa di comandi...")
+    log.info("✓ Bot running. Waiting for commands...")
     app.run_polling()
