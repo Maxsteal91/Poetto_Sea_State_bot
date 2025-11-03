@@ -73,12 +73,24 @@ MESSAGES_ROUGH = [
     "🚫 Mare turbolento, non è sicuro nuotare.",
 ]
 
-# STATE
-user_chat_id = None
-user_notify_hour = 9
-user_notify_minute = 30
-user_output_format = "frame"
-scheduled_job_id = None
+# STATE - Per-user settings using dictionaries
+user_settings = {}  # {chat_id: {'notify_hour': 9, 'notify_minute': 30, 'output_format': 'frame'}}
+
+# Default settings
+DEFAULT_NOTIFY_HOUR = 9
+DEFAULT_NOTIFY_MINUTE = 30
+DEFAULT_OUTPUT_FORMAT = "frame"
+
+
+def get_user_settings(chat_id):
+    """Get or create user settings"""
+    if chat_id not in user_settings:
+        user_settings[chat_id] = {
+            'notify_hour': DEFAULT_NOTIFY_HOUR,
+            'notify_minute': DEFAULT_NOTIFY_MINUTE,
+            'output_format': DEFAULT_OUTPUT_FORMAT
+        }
+    return user_settings[chat_id]
 
 # SETUP DIRECTORIES
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -289,9 +301,9 @@ def convert_ts_to_mp4(ts_path):
 # TELEGRAM HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    global user_chat_id
-    user_chat_id = update.effective_chat.id
-    log.info(f"Bot started by user_id: {user_chat_id}")
+    chat_id = update.effective_chat.id
+    settings = get_user_settings(chat_id)
+    log.info(f"Bot started by user_id: {chat_id}")
     
     await update.message.reply_text(
         "🌊 <b>Sea Monitoring Bot</b>\n\n"
@@ -302,32 +314,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/output - Choose output format (frame/video)\n"
         "/start - Show this message\n\n"
         f"📊 <b>Current status:</b>\n"
-        f"• Output: {user_output_format.upper()}\n"
-        f"• Scheduled notification: {user_notify_hour:02d}:{user_notify_minute:02d}",
+        f"• Output: {settings['output_format'].upper()}\n"
+        f"• Scheduled notification: {settings['notify_hour']:02d}:{settings['notify_minute']:02d}",
         parse_mode="HTML"
     )
 
 
 async def inference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /inference command"""
-    global user_chat_id
-    user_chat_id = update.effective_chat.id
-    log.info(f"Inference requested by user_id: {user_chat_id}")
+    chat_id = update.effective_chat.id
+    log.info(f"Inference requested by user_id: {chat_id}")
     await update.message.reply_text("⏳ Downloading and analyzing...")
-    await run_inference(context, is_scheduled=False)
+    await run_inference(context, chat_id, is_scheduled=False)
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /settings command"""
+    chat_id = update.effective_chat.id
+    settings = get_user_settings(chat_id)
     await update.message.reply_text(
-        f"⏰ Current time: {user_notify_hour:02d}:{user_notify_minute:02d}\n\nEnter hour (0-23):"
+        f"⏰ Current time: {settings['notify_hour']:02d}:{settings['notify_minute']:02d}\n\nEnter hour (0-23):"
     )
     context.user_data['setting_mode'] = 'hour'
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text input for settings"""
-    global user_notify_hour, user_notify_minute, scheduled_job_id
+    chat_id = update.effective_chat.id
+    settings = get_user_settings(chat_id)
     
     if 'setting_mode' not in context.user_data:
         return
@@ -339,7 +353,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not 0 <= value <= 23:
                 await update.message.reply_text("❌ Enter a valid hour (0-23)")
                 return
-            user_notify_hour = value
+            settings['notify_hour'] = value
             context.user_data['setting_mode'] = 'minute'
             await update.message.reply_text(f"✓ Hour: {value:02d}\n\nEnter minutes (0-59):")
         
@@ -347,45 +361,50 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not 0 <= value <= 59:
                 await update.message.reply_text("❌ Enter valid minutes (0-59)")
                 return
-            user_notify_minute = value
+            settings['notify_minute'] = value
             del context.user_data['setting_mode']
             
-            # Remove all previous jobs
+            # Remove all previous jobs for this user
+            job_name = f"scheduled_inference_{chat_id}"
             for job in context.job_queue.jobs():
-                if job.name == "scheduled_inference":
+                if job.name == job_name:
                     job.schedule_removal()
             
             # Calculate seconds until next scheduled time
             tz = pytz.timezone('Europe/Rome')
             now = datetime.datetime.now(tz)
-            next_run = now.replace(hour=user_notify_hour, minute=user_notify_minute, second=0, microsecond=0)
+            next_run = now.replace(hour=settings['notify_hour'], minute=settings['notify_minute'], second=0, microsecond=0)
             if next_run <= now:
                 next_run += datetime.timedelta(days=1)
             delay = (next_run - now).total_seconds()
             
-            job = context.job_queue.run_repeating(
+            # Schedule job with user-specific name and data
+            context.job_queue.run_repeating(
                 scheduled_inference,
                 interval=86400,
                 first=delay,
-                name="scheduled_inference"
+                name=job_name,
+                chat_id=chat_id,
+                data={'chat_id': chat_id}
             )
             
-            log.info(f"Notification updated to {user_notify_hour:02d}:{user_notify_minute:02d} (Italian time)")
-            await update.message.reply_text(f"✓ Scheduled notification updated to {user_notify_hour:02d}:{user_notify_minute:02d}\n\n📅 Next notification will arrive at that time.")
+            log.info(f"Notification updated to {settings['notify_hour']:02d}:{settings['notify_minute']:02d} for user {chat_id}")
+            await update.message.reply_text(f"✓ Scheduled notification updated to {settings['notify_hour']:02d}:{settings['notify_minute']:02d}\n\n📅 Next notification will arrive at that time.")
     except ValueError:
         await update.message.reply_text("❌ Enter a valid number")
 
 
 async def output_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /output command"""
-    global user_output_format
+    chat_id = update.effective_chat.id
+    settings = get_user_settings(chat_id)
     keyboard = [
         [InlineKeyboardButton("🖼️ Frame", callback_data="output_frame")],
         [InlineKeyboardButton("🎬 Video", callback_data="output_video")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Current output: <b>{user_output_format.upper()}</b>\n\nChoose format:",
+        f"Current output: <b>{settings['output_format'].upper()}</b>\n\nChoose format:",
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
@@ -393,30 +412,33 @@ async def output_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard callbacks"""
-    global user_output_format
+    chat_id = update.effective_chat.id
+    settings = get_user_settings(chat_id)
     query = update.callback_query
     await query.answer()
     
     if query.data == "output_frame":
-        user_output_format = "frame"
+        settings['output_format'] = "frame"
         await query.edit_message_text(text="✓ Output: Frame")
     elif query.data == "output_video":
-        user_output_format = "video"
+        settings['output_format'] = "video"
         await query.edit_message_text(text="✓ Output: Full Video (MP4)")
     elif query.data == "inference_now":
         await query.edit_message_text(text="⏳ Analyzing...")
-        await run_inference(context, is_scheduled=False)
+        await run_inference(context, chat_id, is_scheduled=False)
 
 
 # INFERENCE
-async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
+async def run_inference(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_scheduled=True):
     """Run complete inference pipeline"""
+    settings = get_user_settings(chat_id)
+    
     try:
         log.info("Starting video download...")
         video_path = download_video()
         if not video_path:
             log.error("Video download failed")
-            await context.bot.send_message(chat_id=user_chat_id, text="❌ Error: Failed to download video")
+            await context.bot.send_message(chat_id=chat_id, text="❌ Error: Failed to download video")
             return
         
         log.info(f"Video downloaded: {video_path}. Starting inference...")
@@ -429,31 +451,31 @@ async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
         else:
             random_msg = random.choice(MESSAGES_ROUGH)
         
-        message = f"🌊 <b>Spiaggia Poetto - Cagliari</b>\n\n<b>{pred.upper()}</b>\n{prob*100:.1f}% confidence\n\n{random_msg}\n\n⏰ Next notification: {user_notify_hour:02d}:{user_notify_minute:02d}"
+        message = f"🌊 <b>Spiaggia Poetto - Cagliari</b>\n\n<b>{pred.upper()}</b>\n{prob*100:.1f}% confidence\n\n{random_msg}\n\n⏰ Next notification: {settings['notify_hour']:02d}:{settings['notify_minute']:02d}"
         
-        if user_output_format == "frame":
+        if settings['output_format'] == "frame":
             frame_path = extract_frame(video_path)
             with open(frame_path, "rb") as f:
-                await context.bot.send_photo(chat_id=user_chat_id, photo=f, caption=message, parse_mode="HTML")
+                await context.bot.send_photo(chat_id=chat_id, photo=f, caption=message, parse_mode="HTML")
         else:
             mp4_path = convert_ts_to_mp4(video_path)
             if mp4_path:
                 with open(mp4_path, "rb") as f:
-                    await context.bot.send_video(chat_id=user_chat_id, video=f, caption=message, parse_mode="HTML")
+                    await context.bot.send_video(chat_id=chat_id, video=f, caption=message, parse_mode="HTML")
             else:
-                await context.bot.send_message(chat_id=user_chat_id, text="❌ Error: Failed to convert video")
+                await context.bot.send_message(chat_id=chat_id, text="❌ Error: Failed to convert video")
         
         # Add button for immediate inference
         if not is_scheduled:
             keyboard = [[InlineKeyboardButton("🔄 Analyze again", callback_data="inference_now")]]
             await context.bot.send_message(
-                chat_id=user_chat_id,
+                chat_id=chat_id,
                 text="Want to run another analysis?",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
     except Exception as e:
         log.error(f"Inference error: {e}")
-        await context.bot.send_message(chat_id=user_chat_id, text=f"❌ Error: {str(e)}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {str(e)}")
     finally:
         log.info("Cleaning temp folder...")
         cleanup_temp()
@@ -462,9 +484,10 @@ async def run_inference(context: ContextTypes.DEFAULT_TYPE, is_scheduled=True):
 # SCHEDULED JOB
 async def scheduled_inference(context: ContextTypes.DEFAULT_TYPE):
     """Run inference at scheduled time"""
-    if user_chat_id:
-        log.info(f"Automatic notification at {user_notify_hour:02d}:{user_notify_minute:02d}")
-        await run_inference(context, is_scheduled=True)
+    chat_id = context.job.chat_id
+    settings = get_user_settings(chat_id)
+    log.info(f"Automatic notification at {settings['notify_hour']:02d}:{settings['notify_minute']:02d} for user {chat_id}")
+    await run_inference(context, chat_id, is_scheduled=True)
 
 
 # MAIN
@@ -479,23 +502,10 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Job queue for scheduled notifications
+    # Job queue for scheduled notifications - no initial job, users set their own schedules
     job_queue = app.job_queue
     if job_queue:
-        tz = pytz.timezone('Europe/Rome')
-        now = datetime.datetime.now(tz)
-        next_run = now.replace(hour=user_notify_hour, minute=user_notify_minute, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += datetime.timedelta(days=1)
-        delay = (next_run - now).total_seconds()
-        
-        job = job_queue.run_repeating(
-            scheduled_inference,
-            interval=86400,
-            first=delay,
-            name="scheduled_inference"
-        )
-        log.info(f"✓ Job scheduler configured: notification at {user_notify_hour:02d}:{user_notify_minute:02d} (Italian time)")
+        log.info("✓ Job scheduler ready (users can set notifications via /settings)")
     else:
         log.warning("Job queue not available. Install with: pip install python-telegram-bot[job-queue]")
     
