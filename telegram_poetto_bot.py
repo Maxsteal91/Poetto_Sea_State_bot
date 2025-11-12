@@ -53,6 +53,7 @@ RETRIES = 2
 
 FRAME_COUNT = 16
 ROI = (430, 600, 430 + 1400, 600 + 350)
+# ROI = (730, 300, 730 + 1150, 300 + 350) # new ROI based on recent cam movement
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 class_names = ["mare_calmo", "mare_mosso"]
 
@@ -65,6 +66,22 @@ MESSAGES_CALM = [
     "🏖️ Mare tranquillo, è il momento di divertirsi!",
 ]
 
+MESSAGES_CALM += [
+    "🏖️ Il mare è una tavola! Perfetto per un tuffo da manuale!",
+    "😎 Onde? Zero. Relax? Totale. Costume e via!",
+    "☀️ Mare calmissimo, ti aspetta per una nuotata da sogno!",
+    "🐚 È così tranquillo che potresti quasi dormire a galla!",
+    "🌊 Condizioni top: acqua limpida, zero scuse… tutti in acqua!",
+]
+
+MESSAGES_CALM += [
+    "🏊‍♂️ Mare piatto come una piscina! Tuffati senza pensarci!",
+    "🌴 Acqua calma e cristallina… sembra una pubblicità della Maldive!",
+    "🦀 Anche i granchi oggi si rilassano: mare perfetto!",
+    "💦 Nemmeno un’onda all’orizzonte… condizioni da manuale!",
+    "☕ Mare così tranquillo che potresti portarti la tazzina e bere un caffè in acqua!",
+]
+
 MESSAGES_ROUGH = [
     "⚠️ Mare mosso, meglio non nuotare oggi...",
     "🌪️ Onde forti, rimanda il bagno!",
@@ -73,13 +90,30 @@ MESSAGES_ROUGH = [
     "🚫 Mare turbolento, non è sicuro nuotare.",
 ]
 
+MESSAGES_ROUGH += [
+    "🌪️ Oggi il mare sembra un frullatore… meglio rimandare il tuffo!",
+    "⚠️ Onde agitate in arrivo! Il mare ha deciso di fare il DJ oggi.",
+    "🚫 Non è il giorno giusto per sfidare Nettuno… resta a terra!",
+    "😬 Mare un po’ nervoso oggi. Meglio lasciarlo sbollire!",
+    "🌊 Oggi il mare è in modalità 'lavatrice': bagno rimandato!",
+]
+
+MESSAGES_ROUGH += [
+    "🌊 Oggi il mare ha il suo caratterino… meglio lasciarlo sfogare!",
+    "😅 Le onde fanno più rumore del vicino con la motosega… niente bagno!",
+    "🌀 Se entri oggi, esci domani… e forse in un’altra spiaggia!",
+    "🐉 Mare agitato: sembra che ci sia un drago sott’acqua!",
+    "🚷 Il mare oggi non è dell’umore giusto… meglio il lettino e un gelato!",
+]
+
+
 # STATE - Per-user settings using dictionaries
 user_settings = {}  # {chat_id: {'notify_hour': 9, 'notify_minute': 30, 'output_format': 'frame'}}
 
 # Default settings
-DEFAULT_NOTIFY_HOUR = 9
-DEFAULT_NOTIFY_MINUTE = 30
-DEFAULT_OUTPUT_FORMAT = "frame"
+DEFAULT_NOTIFY_HOUR = 8
+DEFAULT_NOTIFY_MINUTE = 0
+DEFAULT_OUTPUT_FORMAT = "video"
 
 
 def get_user_settings(chat_id):
