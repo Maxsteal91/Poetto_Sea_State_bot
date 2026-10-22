@@ -32,6 +32,7 @@ from telegram.ext import (
     filters,
 )
 
+import feedback_store
 from get_wind_info import LAT, LON, get_wind
 from sea_conditions import (
     CALM_WAVE_HEIGHT,
@@ -155,6 +156,10 @@ MESSAGES_UNCERTAIN = [
 #   'notify_time': "HH:MM" or None (daily notification disabled)
 #   'output_format': "frame" or "video"
 DEFAULT_OUTPUT_FORMAT = "video"
+# Vote buttons under each result: the key is the label saved with the clips (must be in class_names)
+FEEDBACK_BUTTONS = {"mare_calmo": "🏖️ È calmo", "mare_mosso": "🌊 È mosso"}
+# How often to delete clips nobody voted on (older than feedback_store.PENDING_MAX_AGE_HOURS)
+FEEDBACK_CLEANUP_INTERVAL_SECONDS = 3600
 QUICK_NOTIFY_TIMES = ["07:00", "08:00", "09:00", "10:00"]
 
 BOT_COMMANDS = [
@@ -415,6 +420,35 @@ class SeaAnalysis:
     media_path: str  # frame (.jpg) or video (.mp4) to send to the user
     wind_text: str | None
     marine: MarineNow | None
+    feedback_id: str | None  # None if the clips could not be saved: no vote buttons then
+
+
+def keep_clips_for_feedback(
+    video_paths: list[str], label: str, confidence: float, top_class: str, marine: MarineNow | None, wind_text: str | None
+) -> str | None:
+    """Save the analyzed clips and metadata until the user votes; returns the feedback id or None on disk errors"""
+    now = datetime.datetime.now(TIMEZONE)
+    feedback_id = feedback_store.new_analysis_id(now)
+    metadata = {
+        "analysis_id": feedback_id,
+        "created_at": now.isoformat(timespec="seconds"),
+        "predicted_label": label,
+        "top_class": top_class,
+        "confidence": round(confidence, 4),
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "roi": list(ROI),
+        "model_file": os.path.basename(MODEL_PATH),
+        "wave_height": marine.wave_height if marine else None,
+        "sea_temperature": marine.sea_temperature if marine else None,
+        "wind": wind_text,
+    }
+    try:
+        feedback_store.save_pending(feedback_id, video_paths, metadata)
+    except OSError:
+        # Feedback is a bonus: the user still gets the result, just without vote buttons
+        log.exception("Could not save clips for feedback")
+        return None
+    return feedback_id
 
 
 def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
@@ -439,7 +473,17 @@ def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
 
     wind_text = get_wind(LAT, LON)
     marine = get_marine_now(LAT, LON)
-    return SeaAnalysis(label, confidence, top_class, len(video_paths), media_path, wind_text, marine)
+    feedback_id = keep_clips_for_feedback(video_paths, label, confidence, top_class, marine, wind_text)
+    return SeaAnalysis(
+        label=label,
+        confidence=confidence,
+        top_class=top_class,
+        n_segments=len(video_paths),
+        media_path=media_path,
+        wind_text=wind_text,
+        marine=marine,
+        feedback_id=feedback_id,
+    )
 
 
 # SETTINGS AND MESSAGES
@@ -497,6 +541,8 @@ def build_caption(analysis: SeaAnalysis, scheduled_time: str | None = None) -> s
     if mismatch_note:
         lines += ["", mismatch_note]
     lines += ["", random_msg]
+    if analysis.feedback_id:
+        lines += ["", "👇 Secondo te com'è il mare nel video? Il tuo voto aiuta a migliorare il bot"]
     if scheduled_time:
         lines += ["", f"⏰ Notifica giornaliera delle {scheduled_time} · /stop per disattivarla"]
     return "\n".join(lines)
@@ -566,9 +612,30 @@ def notify_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([time_buttons, [off_button]])
 
 
-def again_keyboard() -> InlineKeyboardMarkup:
-    """Button attached to each result to run a new analysis"""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Analizza di nuovo", callback_data="inference_now")]])
+def result_keyboard(feedback_id: str | None) -> InlineKeyboardMarkup:
+    """Buttons attached to each result: vote on the sea state (if clips were saved) and analyze again"""
+    rows = []
+    if feedback_id:
+        vote_row = []
+        for class_name, button_text in FEEDBACK_BUTTONS.items():
+            vote_row.append(InlineKeyboardButton(button_text, callback_data=f"fb:{feedback_id}:{class_name}"))
+        rows.append(vote_row)
+    rows.append([InlineKeyboardButton("🔄 Analizza di nuovo", callback_data="inference_now")])
+    return InlineKeyboardMarkup(rows)
+
+
+def keyboard_without(markup: InlineKeyboardMarkup | None, callback_prefix: str) -> InlineKeyboardMarkup | None:
+    """Copy of markup without the rows containing a button whose callback_data starts with callback_prefix"""
+    if markup is None:
+        return None
+    kept_rows = []
+    for row in markup.inline_keyboard:
+        row_matches = any(button.callback_data and button.callback_data.startswith(callback_prefix) for button in row)
+        if not row_matches:
+            kept_rows.append(list(row))
+    if not kept_rows:
+        return None
+    return InlineKeyboardMarkup(kept_rows)
 
 
 # SCHEDULING
@@ -701,6 +768,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = update.effective_chat.id
     settings = get_chat_settings(context.chat_data)
     action, _, value = query.data.partition(":")
+    if action == "fb":
+        # Answered inside, with a "thank you" toast
+        feedback_id, _, user_label = value.partition(":")
+        await handle_feedback(query, feedback_id, user_label)
+        return
     await query.answer()
 
     if action == "output" and value in OUTPUT_FORMAT_NAMES:
@@ -712,14 +784,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         update_notify_time(context, chat_id, notify_time)
         await query.edit_message_text(text=notify_confirmation(notify_time))
     elif action == "inference_now":
-        # Remove the button so the same result can't be tapped twice
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except BadRequest as e:
-            log.warning(f"Could not remove button for chat {chat_id}: {e}")
+        # Remove the button so the same result can't be tapped twice (vote buttons stay)
+        await edit_keyboard_quietly(query, keyboard_without(query.message.reply_markup, "inference_now"))
         await run_inference(context, chat_id)
     else:
         log.warning(f"Unknown callback data from chat {chat_id}: {query.data}")
+
+
+async def handle_feedback(query, feedback_id: str, user_label: str) -> None:
+    """Record the user's vote on a result and remove the vote buttons"""
+    now = datetime.datetime.now(TIMEZONE)
+    try:
+        saved = await asyncio.to_thread(feedback_store.record_feedback, feedback_id, user_label, class_names, now)
+    except ValueError as e:
+        log.warning(f"Ignoring invalid feedback: {e}")
+        await query.answer()
+        return
+
+    if saved:
+        await query.answer(f"Grazie! Segnato come {format_label(user_label).lower()} 🙏")
+    else:
+        await query.answer("Questa clip non è più disponibile, grazie comunque!")
+    await edit_keyboard_quietly(query, keyboard_without(query.message.reply_markup, "fb:"))
+
+
+async def edit_keyboard_quietly(query, reply_markup: InlineKeyboardMarkup | None) -> None:
+    """Replace the buttons of the message a callback came from, logging (not raising) if Telegram refuses"""
+    try:
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except BadRequest as e:
+        log.warning(f"Could not edit buttons: {e}")
 
 
 # INFERENCE
@@ -735,7 +829,11 @@ async def send_analysis(
     with open(analysis.media_path, "rb") as media_file:
         if is_photo:
             await context.bot.send_photo(
-                chat_id=chat_id, photo=media_file, caption=caption, parse_mode="HTML", reply_markup=again_keyboard()
+                chat_id=chat_id,
+                photo=media_file,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=result_keyboard(analysis.feedback_id),
             )
         else:
             await context.bot.send_video(
@@ -744,7 +842,7 @@ async def send_analysis(
                 caption=caption,
                 parse_mode="HTML",
                 supports_streaming=True,
-                reply_markup=again_keyboard(),
+                reply_markup=result_keyboard(analysis.feedback_id),
             )
 
 
@@ -800,6 +898,13 @@ async def scheduled_inference(context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_inference(context, chat_id, scheduled_time=settings["notify_time"])
 
 
+async def cleanup_pending_feedback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic job: delete saved clips that nobody voted on in time"""
+    deleted = await asyncio.to_thread(feedback_store.delete_expired_pending)
+    if deleted:
+        log.info(f"Deleted {deleted} expired feedback clips")
+
+
 async def post_init(application: Application) -> None:
     """Restore daily jobs from persisted chat settings and register the command menu"""
     restored = 0
@@ -809,6 +914,10 @@ async def post_init(application: Application) -> None:
             schedule_daily_job(application.job_queue, chat_id, notify_time)
             restored += 1
     log.info(f"Restored {restored} daily notifications from {PERSISTENCE_PATH}")
+
+    application.job_queue.run_repeating(
+        cleanup_pending_feedback, interval=FEEDBACK_CLEANUP_INTERVAL_SECONDS, first=60, name="cleanup_pending_feedback"
+    )
 
     # The command menu is a nicety: a slow Telegram API must not stop the bot from starting
     try:

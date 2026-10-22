@@ -42,3 +42,9 @@ Bot state:
 - `concurrent_updates(True)`: handlers run concurrently; `chats_in_progress` ignores repeated requests from the same chat.
 - Commands: `/start`, `/analizza` (alias `/inference`), `/previsioni` (wave/wind forecast by time slot, `sea_conditions.get_forecast`), `/notifica` (alias `/settings`), `/stop`, `/output`. Callback data is `action:value` (`output:frame|video`, `notify:HH:MM|off`, `inference_now`). After `/notifica`, free text is parsed by `parse_notify_time` (flag `user_data['awaiting_notify_time']`).
 - User-facing texts are in Italian.
+
+User feedback (dataset for retraining, `feedback_store.py`):
+- `analyze_sea` copies the analyzed `.ts` segments plus `metadata.json` (prediction, confidence, ROI, waves, wind) to `data/feedback_pending/<feedback_id>/`. If that fails, the result is sent without vote buttons.
+- Each result has vote buttons (`FEEDBACK_BUTTONS`, callback `fb:<feedback_id>:<class_name>`). A vote moves the folder to `data/feedback/<class_name>/<feedback_id>/` and appends a row to `data/feedback/labels.csv`. The first vote wins.
+- The `cleanup_pending_feedback` job deletes unvoted folders older than `feedback_store.PENDING_MAX_AGE_HOURS`.
+- Folder names under `data/feedback/` are `class_names`, so they can be used directly as training labels.
