@@ -2,3 +2,4 @@ model/*.pth
 .env
 data/
 temp/
+__pycache__/

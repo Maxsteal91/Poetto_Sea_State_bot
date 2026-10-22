@@ -33,6 +33,15 @@ from telegram.ext import (
 )
 
 from get_wind_info import LAT, LON, get_wind
+from sea_conditions import (
+    CALM_WAVE_HEIGHT,
+    ROUGH_WAVE_HEIGHT,
+    MarineNow,
+    SlotForecast,
+    describe_waves,
+    get_forecast,
+    get_marine_now,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
@@ -150,6 +159,7 @@ QUICK_NOTIFY_TIMES = ["07:00", "08:00", "09:00", "10:00"]
 
 BOT_COMMANDS = [
     BotCommand("analizza", "Analizza il mare adesso"),
+    BotCommand("previsioni", "Onde e vento previsti per oggi e domani"),
     BotCommand("notifica", "Imposta la notifica giornaliera"),
     BotCommand("stop", "Disattiva la notifica giornaliera"),
     BotCommand("output", "Scegli foto o video"),
@@ -404,6 +414,7 @@ class SeaAnalysis:
     n_segments: int
     media_path: str  # frame (.jpg) or video (.mp4) to send to the user
     wind_text: str | None
+    marine: MarineNow | None
 
 
 def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
@@ -427,7 +438,8 @@ def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
         raise RuntimeError(f"Failed to prepare {output_format} from {latest_video}")
 
     wind_text = get_wind(LAT, LON)
-    return SeaAnalysis(label, confidence, top_class, len(video_paths), media_path, wind_text)
+    marine = get_marine_now(LAT, LON)
+    return SeaAnalysis(label, confidence, top_class, len(video_paths), media_path, wind_text, marine)
 
 
 # SETTINGS AND MESSAGES
@@ -477,11 +489,58 @@ def build_caption(analysis: SeaAnalysis, scheduled_time: str | None = None) -> s
         result_text = f"<b>{format_label(analysis.label)}</b>\nAffidabilità: {analysis.confidence * 100:.0f}%"
 
     lines = ["🌊 <b>Spiaggia del Poetto - Cagliari</b>", "", result_text, f"📹 Media su {analysis.n_segments} clip"]
+    if analysis.marine:
+        lines.append(format_marine_now(analysis.marine))
     if analysis.wind_text:
         lines.append(f"💨 {analysis.wind_text}")
+    mismatch_note = marine_mismatch_note(analysis.label, analysis.marine)
+    if mismatch_note:
+        lines += ["", mismatch_note]
     lines += ["", random_msg]
     if scheduled_time:
         lines += ["", f"⏰ Notifica giornaliera delle {scheduled_time} · /stop per disattivarla"]
+    return "\n".join(lines)
+
+
+def format_marine_now(marine: MarineNow) -> str:
+    """'🌡️ Acqua 23 °C · 〰️ Onde 0.5 m (poco mosso)'"""
+    waves_text = f"〰️ Onde {marine.wave_height:.1f} m ({describe_waves(marine.wave_height)})"
+    if marine.sea_temperature is None:
+        return waves_text
+    return f"🌡️ Acqua {marine.sea_temperature:.0f} °C · {waves_text}"
+
+
+def marine_mismatch_note(label: str, marine: MarineNow | None) -> str | None:
+    """Warn when the webcam model and the Open-Meteo wave estimate clearly disagree"""
+    if marine is None:
+        return None
+    if "calmo" in label and marine.wave_height >= ROUGH_WAVE_HEIGHT:
+        return f"⚠️ Le previsioni stimano onde da {marine.wave_height:.1f} m: guarda bene il video prima di entrare!"
+    if "mosso" in label and marine.wave_height < CALM_WAVE_HEIGHT:
+        return f"ℹ️ Le previsioni stimano onde di soli {marine.wave_height:.1f} m: guarda il video per conferma."
+    return None
+
+
+def day_label(day: datetime.date, today: datetime.date) -> str:
+    """'Oggi', 'Domani' or 'dd/mm'"""
+    if day == today:
+        return "Oggi"
+    if day == today + datetime.timedelta(days=1):
+        return "Domani"
+    return day.strftime("%d/%m")
+
+
+def format_forecast(slots: list[SlotForecast], marine: MarineNow | None, today: datetime.date) -> str:
+    """HTML message for /previsioni"""
+    lines = ["🔮 <b>Previsioni Poetto</b>", ""]
+    for slot in slots:
+        lines.append(
+            f"<b>{day_label(slot.day, today)} {slot.slot_name}</b>: {describe_waves(slot.max_wave_height)}, "
+            f"onde fino a {slot.max_wave_height:.1f} m · vento {slot.mean_wind_speed:.0f} km/h {slot.wind_direction}"
+        )
+    if marine and marine.sea_temperature is not None:
+        lines += ["", f"🌡️ Acqua adesso: {marine.sea_temperature:.0f} °C"]
+    lines += ["", "<i>Stime Open-Meteo al largo, non osservazioni a riva. Per com'è adesso usa /analizza</i>"]
     return "\n".join(lines)
 
 
@@ -561,6 +620,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Ti dico com'è il mare al Poetto analizzando la webcam in tempo reale.\n\n"
         "<b>Comandi:</b>\n"
         "/analizza - Analizza il mare adesso\n"
+        "/previsioni - Onde e vento previsti per oggi e domani\n"
         "/notifica - Ricevi l'analisi ogni giorno a un orario\n"
         "/stop - Disattiva la notifica giornaliera\n"
         "/output - Scegli se ricevere foto o video\n\n"
@@ -576,6 +636,17 @@ async def inference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     log.info(f"Inference requested by chat_id: {chat_id}")
     await run_inference(context, chat_id)
+
+
+async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /previsioni command"""
+    now = datetime.datetime.now(TIMEZONE)
+    slots = await asyncio.to_thread(get_forecast, LAT, LON, now)
+    if not slots:
+        await update.message.reply_text("❌ Previsioni non disponibili al momento, riprova più tardi.")
+        return
+    marine = await asyncio.to_thread(get_marine_now, LAT, LON)
+    await update.message.reply_text(format_forecast(slots, marine, now.date()), parse_mode="HTML")
 
 
 async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -764,6 +835,7 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler(["analizza", "inference"], inference))
+    app.add_handler(CommandHandler("previsioni", forecast_command))
     app.add_handler(CommandHandler(["notifica", "settings"], notify_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("output", output_format))
