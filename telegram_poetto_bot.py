@@ -419,7 +419,6 @@ class SeaAnalysis:
     label: str  # class name or UNCERTAIN_LABEL
     confidence: float  # averaged probability of top_class
     top_class: str
-    n_segments: int
     media_path: str  # frame (.jpg) or video (.mp4) to send to the user
     wind_text: str | None
     marine: MarineNow | None
@@ -481,7 +480,6 @@ def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
         label=label,
         confidence=confidence,
         top_class=top_class,
-        n_segments=len(video_paths),
         media_path=media_path,
         wind_text=wind_text,
         marine=marine,
@@ -535,7 +533,7 @@ def build_caption(analysis: SeaAnalysis, scheduled_time: str | None = None) -> s
         random_msg = random.choice(MESSAGES_ROUGH)
         result_text = f"<b>{format_label(analysis.label)}</b>\nAffidabilità: {analysis.confidence * 100:.0f}%"
 
-    lines = ["🌊 <b>Spiaggia del Poetto - Cagliari</b>", "", result_text, f"📹 Media su {analysis.n_segments} clip"]
+    lines = ["🌊 <b>Spiaggia del Poetto - Cagliari</b>", "", result_text]
     if analysis.marine:
         lines.append(format_marine_now(analysis.marine))
     if analysis.wind_text:
