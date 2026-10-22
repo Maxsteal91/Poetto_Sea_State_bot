@@ -2,21 +2,37 @@
 import os
 import time
 import random
+import asyncio
+import tempfile
+from dataclasses import dataclass
 import cv2
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from torchvision.models.video import r3d_18, R3D_18_Weights
+from torchvision.models.video import r3d_18
 import requests
 from urllib.parse import urljoin, urlparse
 import logging
-import shutil
 import datetime
-import pytz
+from zoneinfo import ZoneInfo
 import gdown
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.constants import ChatAction
+from telegram.error import BadRequest, Forbidden
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    JobQueue,
+    PicklePersistence,
+    filters,
+)
+
+from get_wind_info import LAT, LON, get_wind
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
@@ -44,7 +60,10 @@ print("Telegram token loaded successfully")
 
 # CONFIG
 M3U8_URL = "https://cdn-002.whatsupcams.com/hls/it_cagliari01.m3u8"
-DOWNLOAD_DIR = "./temp"
+DOWNLOAD_DIR = "./temp"  # each analysis works in its own subfolder
+DATA_DIR = "./data"
+PERSISTENCE_PATH = os.path.join(DATA_DIR, "bot_state.pickle")
+TIMEZONE = ZoneInfo("Europe/Rome")
 MODEL_DIR = "./model"
 MODEL_PATH = os.path.join(MODEL_DIR, "r3d_18_poetto.pth")
 MODEL_GDRIVE_ID = "1ASd7VdbSrXXs9fa3EpHFed0W2NlUugq9"
@@ -56,6 +75,12 @@ ROI = (430, 600, 430 + 1400, 600 + 350)
 # ROI = (730, 300, 730 + 1150, 300 + 350) # new ROI based on recent cam movement
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 class_names = ["mare_calmo", "mare_mosso"]
+
+# A single 6s segment gives noisy predictions: average over the most recent ones
+N_SEGMENTS = 3
+# Below this averaged confidence the result is reported as uncertain
+CONFIDENCE_THRESHOLD = 0.70
+UNCERTAIN_LABEL = "incerto"
 
 # Random messages
 MESSAGES_CALM = [
@@ -106,28 +131,37 @@ MESSAGES_ROUGH += [
     "🚷 Il mare oggi non è dell’umore giusto… meglio il lettino e un gelato!",
 ]
 
+MESSAGES_UNCERTAIN = [
+    "🤔 Il mare oggi è difficile da leggere… dai un'occhiata tu prima di tuffarti!",
+    "🧐 Condizioni incerte: guarda il video e decidi tu!",
+    "🌫️ Il modello non è sicuro… meglio controllare di persona!",
+    "🤷 Né calmo né mosso: il mare oggi fa il misterioso!",
+]
 
-# STATE - Per-user settings using dictionaries
-user_settings = {}  # {chat_id: {'notify_hour': 9, 'notify_minute': 30, 'output_format': 'frame'}}
 
-# Default settings
-DEFAULT_NOTIFY_HOUR = 8
-DEFAULT_NOTIFY_MINUTE = 0
+# SETTINGS
+# Per-chat settings live in context.chat_data (saved to disk by PicklePersistence):
+#   'notify_time': "HH:MM" or None (daily notification disabled)
+#   'output_format': "frame" or "video"
 DEFAULT_OUTPUT_FORMAT = "video"
+QUICK_NOTIFY_TIMES = ["07:00", "08:00", "09:00", "10:00"]
 
+BOT_COMMANDS = [
+    BotCommand("analizza", "Analizza il mare adesso"),
+    BotCommand("notifica", "Imposta la notifica giornaliera"),
+    BotCommand("stop", "Disattiva la notifica giornaliera"),
+    BotCommand("output", "Scegli foto o video"),
+    BotCommand("start", "Mostra aiuto e impostazioni"),
+]
 
-def get_user_settings(chat_id):
-    """Get or create user settings"""
-    if chat_id not in user_settings:
-        user_settings[chat_id] = {
-            'notify_hour': DEFAULT_NOTIFY_HOUR,
-            'notify_minute': DEFAULT_NOTIFY_MINUTE,
-            'output_format': DEFAULT_OUTPUT_FORMAT
-        }
-    return user_settings[chat_id]
+# Chats with an analysis in progress, to ignore repeated requests
+chats_in_progress: set[int] = set()
+# One analysis at a time: the model runs on CPU and parallel runs only slow each other down
+analysis_lock = asyncio.Lock()
 
 # SETUP DIRECTORIES
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
@@ -164,8 +198,8 @@ transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-weights = R3D_18_Weights.DEFAULT
-model = r3d_18(weights=weights)
+# No pretrained weights: they would be downloaded at every start and then overwritten by ours
+model = r3d_18(weights=None)
 model.fc = nn.Linear(model.fc.in_features, 2)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model = model.to(DEVICE)
@@ -214,22 +248,31 @@ def download_file(url, out_path):
     return False
 
 
-def download_video():
-    """Download random video segment from M3U8 stream"""
+def download_segments(out_dir: str, n_segments: int = N_SEGMENTS) -> list[str]:
+    """Download the n most recent segments from M3U8 stream into out_dir.
+
+    Returns local paths, most recent first (empty list on failure).
+    """
     text = fetch_text(M3U8_URL)
     if not text:
-        return None
+        return []
     base = M3U8_URL.rsplit("/", 1)[0] + "/"
     ts_urls = parse_m3u8_for_ts(text, base)
     if not ts_urls:
-        return None
-    
-    url = random.choice(ts_urls)
+        return []
+
+    # In a live playlist the most recent segments are at the end
+    recent_urls = list(reversed(ts_urls[-n_segments:]))
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(DOWNLOAD_DIR, f"{timestamp}_cagliari01.ts")
-    if download_file(url, out_path):
-        return out_path
-    return None
+    video_paths = []
+    for index, url in enumerate(recent_urls):
+        out_path = os.path.join(out_dir, f"{timestamp}_{index}_cagliari01.ts")
+        if download_file(url, out_path):
+            video_paths.append(out_path)
+        else:
+            log.warning(f"Skipping segment {url}: download failed")
+    log.info(f"Downloaded {len(video_paths)}/{len(recent_urls)} segments")
+    return video_paths
 
 
 def load_video(video_path, frames_per_clip=FRAME_COUNT, crop_region=ROI):
@@ -257,14 +300,38 @@ def load_video(video_path, frames_per_clip=FRAME_COUNT, crop_region=ROI):
     return frames.unsqueeze(0)
 
 
-def predict(video_path):
-    """Run model inference on video"""
+def predict_probs(video_path: str) -> torch.Tensor:
+    """Run model inference on a single video, return class probabilities (shape [n_classes])"""
     video_tensor = load_video(video_path).to(DEVICE)
     with torch.no_grad():
         outputs = model(video_tensor)
         probs = torch.softmax(outputs, dim=1)
-        pred_class = torch.argmax(probs, dim=1).item()
-    return class_names[pred_class], probs[0][pred_class].item()
+    return probs[0].cpu()
+
+
+def predict(video_paths: list[str]) -> tuple[str, float, str]:
+    """Average class probabilities over several videos.
+
+    Returns (label, confidence, top_class): label is UNCERTAIN_LABEL when the
+    averaged confidence of top_class is below CONFIDENCE_THRESHOLD.
+    """
+    if not video_paths:
+        raise ValueError("No videos to analyze")
+
+    probs_per_video = []
+    for video_path in video_paths:
+        probs = predict_probs(video_path)
+        probs_text = ", ".join(f"{name}={p:.2f}" for name, p in zip(class_names, probs.tolist()))
+        log.info(f"Segment {video_path}: {probs_text}")
+        probs_per_video.append(probs)
+
+    mean_probs = torch.stack(probs_per_video).mean(dim=0)
+    top_index = int(torch.argmax(mean_probs))
+    top_class = class_names[top_index]
+    confidence = mean_probs[top_index].item()
+    label = top_class if confidence >= CONFIDENCE_THRESHOLD else UNCERTAIN_LABEL
+    log.info(f"Averaged over {len(video_paths)} segments: {top_class} ({confidence:.2f}) -> {label}")
+    return label, confidence, top_class
 
 
 def extract_frame(video_path):
@@ -283,13 +350,6 @@ def extract_frame(video_path):
     frame_path = video_path.replace(".ts", "_frame.jpg")
     cv2.imwrite(frame_path, frame)
     return frame_path
-
-
-def cleanup_temp():
-    """Clean temporary directory"""
-    if os.path.exists(DOWNLOAD_DIR):
-        shutil.rmtree(DOWNLOAD_DIR)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 def convert_ts_to_mp4(ts_path):
@@ -332,216 +392,377 @@ def convert_ts_to_mp4(ts_path):
         return None
 
 
+# ANALYSIS PIPELINE (blocking: run it in a worker thread)
+@dataclass
+class SeaAnalysis:
+    """Result of one sea analysis"""
+    label: str  # class name or UNCERTAIN_LABEL
+    confidence: float  # averaged probability of top_class
+    top_class: str
+    n_segments: int
+    media_path: str  # frame (.jpg) or video (.mp4) to send to the user
+    wind_text: str | None
+
+
+def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
+    """Download recent segments into work_dir, run the model and prepare the media to send.
+
+    Raises RuntimeError if the download or the media preparation fails.
+    """
+    video_paths = download_segments(work_dir)
+    if not video_paths:
+        raise RuntimeError("Failed to download video segments")
+
+    label, confidence, top_class = predict(video_paths)
+
+    # Show the user the most recent segment
+    latest_video = video_paths[0]
+    if output_format == "frame":
+        media_path = extract_frame(latest_video)
+    else:
+        media_path = convert_ts_to_mp4(latest_video)
+    if media_path is None:
+        raise RuntimeError(f"Failed to prepare {output_format} from {latest_video}")
+
+    wind_text = get_wind(LAT, LON)
+    return SeaAnalysis(label, confidence, top_class, len(video_paths), media_path, wind_text)
+
+
+# SETTINGS AND MESSAGES
+OUTPUT_FORMAT_NAMES = {"frame": "foto", "video": "video"}
+
+
+def get_chat_settings(chat_data: dict) -> dict:
+    """Fill missing settings with defaults; returns the same chat_data dict"""
+    chat_data.setdefault("notify_time", None)
+    chat_data.setdefault("output_format", DEFAULT_OUTPUT_FORMAT)
+    return chat_data
+
+
+def describe_notify_time(notify_time: str | None) -> str:
+    """Human readable notification status"""
+    if notify_time is None:
+        return "non attiva"
+    return f"ogni giorno alle {notify_time}"
+
+
+def notify_confirmation(notify_time: str | None) -> str:
+    """Reply text after the notification time has been changed"""
+    if notify_time is None:
+        return "🔕 Notifica giornaliera disattivata. Riattivala con /notifica"
+    return f"✓ Riceverai l'analisi del mare ogni giorno alle {notify_time}. Disattivala con /stop"
+
+
+def format_label(class_name: str) -> str:
+    """'mare_calmo' -> 'MARE CALMO'"""
+    return class_name.replace("_", " ").upper()
+
+
+def build_caption(analysis: SeaAnalysis, scheduled_time: str | None = None) -> str:
+    """Build the HTML caption sent with the frame/video.
+
+    scheduled_time is set only for daily notifications, to remind how to turn them off.
+    """
+    if analysis.label == UNCERTAIN_LABEL:
+        random_msg = random.choice(MESSAGES_UNCERTAIN)
+        tendency = format_label(analysis.top_class).lower()
+        result_text = f"<b>INCERTO</b>\nTendenza: {tendency} ({analysis.confidence * 100:.0f}%)"
+    elif "calmo" in analysis.label:
+        random_msg = random.choice(MESSAGES_CALM)
+        result_text = f"<b>{format_label(analysis.label)}</b>\nAffidabilità: {analysis.confidence * 100:.0f}%"
+    else:
+        random_msg = random.choice(MESSAGES_ROUGH)
+        result_text = f"<b>{format_label(analysis.label)}</b>\nAffidabilità: {analysis.confidence * 100:.0f}%"
+
+    lines = ["🌊 <b>Spiaggia del Poetto - Cagliari</b>", "", result_text, f"📹 Media su {analysis.n_segments} clip"]
+    if analysis.wind_text:
+        lines.append(f"💨 {analysis.wind_text}")
+    lines += ["", random_msg]
+    if scheduled_time:
+        lines += ["", f"⏰ Notifica giornaliera delle {scheduled_time} · /stop per disattivarla"]
+    return "\n".join(lines)
+
+
+def parse_notify_time(text: str) -> str | None:
+    """Parse '7', '7:30', '07.30' or '7 30' into 'HH:MM'; None if not a valid time"""
+    cleaned = text.strip().replace(".", ":").replace(" ", ":")
+    parts = cleaned.split(":")
+    if len(parts) == 1:
+        parts.append("0")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def notify_keyboard() -> InlineKeyboardMarkup:
+    """Quick choices for the daily notification time"""
+    time_buttons = [InlineKeyboardButton(t, callback_data=f"notify:{t}") for t in QUICK_NOTIFY_TIMES]
+    off_button = InlineKeyboardButton("🔕 Disattiva", callback_data="notify:off")
+    return InlineKeyboardMarkup([time_buttons, [off_button]])
+
+
+def again_keyboard() -> InlineKeyboardMarkup:
+    """Button attached to each result to run a new analysis"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Analizza di nuovo", callback_data="inference_now")]])
+
+
+# SCHEDULING
+def daily_job_name(chat_id: int) -> str:
+    """Name of the daily notification job of a chat"""
+    return f"daily_inference_{chat_id}"
+
+
+def remove_daily_job(job_queue: JobQueue, chat_id: int) -> None:
+    """Remove the daily notification job of a chat, if any"""
+    for job in job_queue.get_jobs_by_name(daily_job_name(chat_id)):
+        job.schedule_removal()
+
+
+def schedule_daily_job(job_queue: JobQueue, chat_id: int, notify_time: str) -> None:
+    """(Re)schedule the daily notification at notify_time ("HH:MM", Europe/Rome time).
+
+    run_daily follows the local clock, so DST changes don't shift the notification.
+    """
+    remove_daily_job(job_queue, chat_id)
+    hour_text, minute_text = notify_time.split(":")
+    job_queue.run_daily(
+        scheduled_inference,
+        time=datetime.time(int(hour_text), int(minute_text), tzinfo=TIMEZONE),
+        chat_id=chat_id,
+        name=daily_job_name(chat_id),
+    )
+    log.info(f"Daily notification for chat {chat_id} scheduled at {notify_time}")
+
+
+def update_notify_time(context: ContextTypes.DEFAULT_TYPE, chat_id: int, notify_time: str | None) -> None:
+    """Save the notification time of a chat and (re)schedule or remove its job"""
+    settings = get_chat_settings(context.chat_data)
+    settings["notify_time"] = notify_time
+    if notify_time is None:
+        remove_daily_job(context.job_queue, chat_id)
+        log.info(f"Daily notification for chat {chat_id} disabled")
+    else:
+        schedule_daily_job(context.job_queue, chat_id, notify_time)
+
+
 # TELEGRAM HANDLERS
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command"""
-    chat_id = update.effective_chat.id
-    settings = get_user_settings(chat_id)
-    log.info(f"Bot started by user_id: {chat_id}")
-    
+    settings = get_chat_settings(context.chat_data)
+    log.info(f"Bot started by chat_id: {update.effective_chat.id}")
     await update.message.reply_text(
-        "🌊 <b>Sea Monitoring Bot</b>\n\n"
-        "Monitor sea conditions in real-time.\n\n"
-        "<b>Available commands:</b>\n"
-        "/inference - Analyze sea now\n"
-        "/settings - Set automatic notification time\n"
-        "/output - Choose output format (frame/video)\n"
-        "/start - Show this message\n\n"
-        f"📊 <b>Current status:</b>\n"
-        f"• Output: {settings['output_format'].upper()}\n"
-        f"• Scheduled notification: {settings['notify_hour']:02d}:{settings['notify_minute']:02d}",
-        parse_mode="HTML"
+        "🌊 <b>Poetto Sea State Bot</b>\n\n"
+        "Ti dico com'è il mare al Poetto analizzando la webcam in tempo reale.\n\n"
+        "<b>Comandi:</b>\n"
+        "/analizza - Analizza il mare adesso\n"
+        "/notifica - Ricevi l'analisi ogni giorno a un orario\n"
+        "/stop - Disattiva la notifica giornaliera\n"
+        "/output - Scegli se ricevere foto o video\n\n"
+        "📊 <b>Le tue impostazioni:</b>\n"
+        f"• Formato: {OUTPUT_FORMAT_NAMES[settings['output_format']]}\n"
+        f"• Notifica: {describe_notify_time(settings['notify_time'])}",
+        parse_mode="HTML",
     )
 
 
-async def inference(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /inference command"""
+async def inference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /analizza (and legacy /inference) command"""
     chat_id = update.effective_chat.id
-    log.info(f"Inference requested by user_id: {chat_id}")
-    await update.message.reply_text("⏳ Downloading and analyzing...")
-    await run_inference(context, chat_id, is_scheduled=False)
+    log.info(f"Inference requested by chat_id: {chat_id}")
+    await run_inference(context, chat_id)
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /settings command"""
-    chat_id = update.effective_chat.id
-    settings = get_user_settings(chat_id)
+async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /notifica (and legacy /settings) command"""
+    settings = get_chat_settings(context.chat_data)
+    context.user_data["awaiting_notify_time"] = True
     await update.message.reply_text(
-        f"⏰ Current time: {settings['notify_hour']:02d}:{settings['notify_minute']:02d}\n\nEnter hour (0-23):"
+        f"⏰ Notifica attuale: {describe_notify_time(settings['notify_time'])}\n\n"
+        "Scegli un orario o scrivilo tu (es. 7:30):",
+        reply_markup=notify_keyboard(),
     )
-    context.user_data['setting_mode'] = 'hour'
 
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input for settings"""
-    chat_id = update.effective_chat.id
-    settings = get_user_settings(chat_id)
-    
-    if 'setting_mode' not in context.user_data:
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stop command"""
+    update_notify_time(context, update.effective_chat.id, None)
+    await update.message.reply_text(notify_confirmation(None))
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle free text: notification time after /notifica, otherwise a short hint"""
+    if not context.user_data.get("awaiting_notify_time"):
+        await update.message.reply_text("Usa /analizza per vedere com'è il mare adesso, o /start per l'aiuto.")
         return
-    
-    try:
-        value = int(update.message.text)
-        
-        if context.user_data['setting_mode'] == 'hour':
-            if not 0 <= value <= 23:
-                await update.message.reply_text("❌ Enter a valid hour (0-23)")
-                return
-            settings['notify_hour'] = value
-            context.user_data['setting_mode'] = 'minute'
-            await update.message.reply_text(f"✓ Hour: {value:02d}\n\nEnter minutes (0-59):")
-        
-        elif context.user_data['setting_mode'] == 'minute':
-            if not 0 <= value <= 59:
-                await update.message.reply_text("❌ Enter valid minutes (0-59)")
-                return
-            settings['notify_minute'] = value
-            del context.user_data['setting_mode']
-            
-            # Remove all previous jobs for this user
-            job_name = f"scheduled_inference_{chat_id}"
-            for job in context.job_queue.jobs():
-                if job.name == job_name:
-                    job.schedule_removal()
-            
-            # Calculate seconds until next scheduled time
-            tz = pytz.timezone('Europe/Rome')
-            now = datetime.datetime.now(tz)
-            next_run = now.replace(hour=settings['notify_hour'], minute=settings['notify_minute'], second=0, microsecond=0)
-            if next_run <= now:
-                next_run += datetime.timedelta(days=1)
-            delay = (next_run - now).total_seconds()
-            
-            # Schedule job with user-specific name and data
-            context.job_queue.run_repeating(
-                scheduled_inference,
-                interval=86400,
-                first=delay,
-                name=job_name,
-                chat_id=chat_id,
-                data={'chat_id': chat_id}
-            )
-            
-            log.info(f"Notification updated to {settings['notify_hour']:02d}:{settings['notify_minute']:02d} for user {chat_id}")
-            await update.message.reply_text(f"✓ Scheduled notification updated to {settings['notify_hour']:02d}:{settings['notify_minute']:02d}\n\n📅 Next notification will arrive at that time.")
-    except ValueError:
-        await update.message.reply_text("❌ Enter a valid number")
+
+    notify_time = parse_notify_time(update.message.text)
+    if notify_time is None:
+        await update.message.reply_text("❌ Orario non valido. Scrivilo come 7:30 oppure 18:00")
+        return
+    context.user_data.pop("awaiting_notify_time", None)
+    update_notify_time(context, update.effective_chat.id, notify_time)
+    await update.message.reply_text(notify_confirmation(notify_time))
 
 
-async def output_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def output_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /output command"""
-    chat_id = update.effective_chat.id
-    settings = get_user_settings(chat_id)
+    settings = get_chat_settings(context.chat_data)
     keyboard = [
-        [InlineKeyboardButton("🖼️ Frame", callback_data="output_frame")],
-        [InlineKeyboardButton("🎬 Video", callback_data="output_video")]
+        [InlineKeyboardButton("🖼️ Foto", callback_data="output:frame")],
+        [InlineKeyboardButton("🎬 Video", callback_data="output:video")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Current output: <b>{settings['output_format'].upper()}</b>\n\nChoose format:",
-        reply_markup=reply_markup,
-        parse_mode="HTML"
+        f"Formato attuale: <b>{OUTPUT_FORMAT_NAMES[settings['output_format']]}</b>\n\nCome vuoi ricevere il risultato?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
     )
 
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard callbacks"""
-    chat_id = update.effective_chat.id
-    settings = get_user_settings(chat_id)
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard callbacks ("action:value")"""
     query = update.callback_query
+    chat_id = update.effective_chat.id
+    settings = get_chat_settings(context.chat_data)
+    action, _, value = query.data.partition(":")
     await query.answer()
-    
-    if query.data == "output_frame":
-        settings['output_format'] = "frame"
-        await query.edit_message_text(text="✓ Output: Frame")
-    elif query.data == "output_video":
-        settings['output_format'] = "video"
-        await query.edit_message_text(text="✓ Output: Full Video (MP4)")
-    elif query.data == "inference_now":
-        await query.edit_message_text(text="⏳ Analyzing...")
-        await run_inference(context, chat_id, is_scheduled=False)
+
+    if action == "output" and value in OUTPUT_FORMAT_NAMES:
+        settings["output_format"] = value
+        await query.edit_message_text(text=f"✓ Formato: {OUTPUT_FORMAT_NAMES[value]}")
+    elif action == "notify":
+        context.user_data.pop("awaiting_notify_time", None)
+        notify_time = None if value == "off" else value
+        update_notify_time(context, chat_id, notify_time)
+        await query.edit_message_text(text=notify_confirmation(notify_time))
+    elif action == "inference_now":
+        # Remove the button so the same result can't be tapped twice
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest as e:
+            log.warning(f"Could not remove button for chat {chat_id}: {e}")
+        await run_inference(context, chat_id)
+    else:
+        log.warning(f"Unknown callback data from chat {chat_id}: {query.data}")
 
 
 # INFERENCE
-async def run_inference(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_scheduled=True):
-    """Run complete inference pipeline"""
-    settings = get_user_settings(chat_id)
-    
-    try:
-        log.info("Starting video download...")
-        video_path = download_video()
-        if not video_path:
-            log.error("Video download failed")
-            await context.bot.send_message(chat_id=chat_id, text="❌ Error: Failed to download video")
-            return
-        
-        log.info(f"Video downloaded: {video_path}. Starting inference...")
-        pred, prob = predict(video_path)
-        log.info(f"Inference complete: {pred} ({prob*100:.1f}%)")
-        
-        # Choose random message
-        if "calmo" in pred.lower():
-            random_msg = random.choice(MESSAGES_CALM)
-        else:
-            random_msg = random.choice(MESSAGES_ROUGH)
-        
-        message = f"🌊 <b>Spiaggia Poetto - Cagliari</b>\n\n<b>{pred.upper()}</b>\n{prob*100:.1f}% confidence\n\n{random_msg}\n\n⏰ Next notification: {settings['notify_hour']:02d}:{settings['notify_minute']:02d}"
-        
-        if settings['output_format'] == "frame":
-            frame_path = extract_frame(video_path)
-            with open(frame_path, "rb") as f:
-                await context.bot.send_photo(chat_id=chat_id, photo=f, caption=message, parse_mode="HTML")
-        else:
-            mp4_path = convert_ts_to_mp4(video_path)
-            if mp4_path:
-                with open(mp4_path, "rb") as f:
-                    await context.bot.send_video(chat_id=chat_id, video=f, caption=message, parse_mode="HTML")
-            else:
-                await context.bot.send_message(chat_id=chat_id, text="❌ Error: Failed to convert video")
-        
-        # Add button for immediate inference
-        if not is_scheduled:
-            keyboard = [[InlineKeyboardButton("🔄 Analyze again", callback_data="inference_now")]]
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Want to run another analysis?",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+async def send_analysis(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, analysis: SeaAnalysis, scheduled_time: str | None
+) -> None:
+    """Send the frame or video with the result caption"""
+    caption = build_caption(analysis, scheduled_time)
+    is_photo = analysis.media_path.endswith(".jpg")
+    chat_action = ChatAction.UPLOAD_PHOTO if is_photo else ChatAction.UPLOAD_VIDEO
+    await context.bot.send_chat_action(chat_id=chat_id, action=chat_action)
+
+    with open(analysis.media_path, "rb") as media_file:
+        if is_photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, photo=media_file, caption=caption, parse_mode="HTML", reply_markup=again_keyboard()
             )
-    except Exception as e:
-        log.error(f"Inference error: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {str(e)}")
+        else:
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=media_file,
+                caption=caption,
+                parse_mode="HTML",
+                supports_streaming=True,
+                reply_markup=again_keyboard(),
+            )
+
+
+async def run_inference(context: ContextTypes.DEFAULT_TYPE, chat_id: int, scheduled_time: str | None = None) -> None:
+    """Run the full analysis for a chat and send the result"""
+    if chat_id in chats_in_progress:
+        await context.bot.send_message(chat_id=chat_id, text="⏳ Sto già analizzando il mare, un attimo di pazienza…")
+        return
+
+    chats_in_progress.add(chat_id)
+    settings = get_chat_settings(context.chat_data)
+    status_message = None
+    try:
+        status_message = await context.bot.send_message(
+            chat_id=chat_id, text="⏳ Scarico le immagini della webcam e analizzo il mare…"
+        )
+        # Per-request folder: concurrent analyses never touch each other's files
+        with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as work_dir:
+            async with analysis_lock:
+                analysis = await asyncio.to_thread(analyze_sea, work_dir, settings["output_format"])
+            log.info(f"Chat {chat_id}: {analysis.label} ({analysis.confidence * 100:.1f}%)")
+            await send_analysis(context, chat_id, analysis, scheduled_time)
+    except Forbidden:
+        # The user blocked the bot: stop sending daily notifications
+        log.warning(f"Chat {chat_id} blocked the bot, disabling its daily notification")
+        update_notify_time(context, chat_id, None)
+    except Exception:
+        # Top-level boundary of the handler: log the full traceback and tell the user
+        log.exception(f"Inference failed for chat {chat_id}")
+        await context.bot.send_message(
+            chat_id=chat_id, text="❌ Non sono riuscito ad analizzare il mare. Riprova tra qualche minuto."
+        )
     finally:
-        log.info("Cleaning temp folder...")
-        cleanup_temp()
+        chats_in_progress.discard(chat_id)
+        if status_message is not None:
+            await delete_message_quietly(status_message)
+
+
+async def delete_message_quietly(message) -> None:
+    """Delete a status message, logging (not raising) if Telegram refuses"""
+    try:
+        await message.delete()
+    except (BadRequest, Forbidden) as e:
+        log.warning(f"Could not delete status message: {e}")
 
 
 # SCHEDULED JOB
-async def scheduled_inference(context: ContextTypes.DEFAULT_TYPE):
-    """Run inference at scheduled time"""
+async def scheduled_inference(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run inference at the scheduled time"""
     chat_id = context.job.chat_id
-    settings = get_user_settings(chat_id)
-    log.info(f"Automatic notification at {settings['notify_hour']:02d}:{settings['notify_minute']:02d} for user {chat_id}")
-    await run_inference(context, chat_id, is_scheduled=True)
+    settings = get_chat_settings(context.chat_data)
+    log.info(f"Daily notification at {settings['notify_time']} for chat {chat_id}")
+    await run_inference(context, chat_id, scheduled_time=settings["notify_time"])
+
+
+async def post_init(application: Application) -> None:
+    """Register the command menu and restore daily jobs from persisted chat settings"""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+
+    restored = 0
+    for chat_id, chat_data in application.chat_data.items():
+        notify_time = chat_data.get("notify_time")
+        if notify_time:
+            schedule_daily_job(application.job_queue, chat_id, notify_time)
+            restored += 1
+    log.info(f"Restored {restored} daily notifications from {PERSISTENCE_PATH}")
 
 
 # MAIN
 if __name__ == "__main__":
     log.info("Starting Telegram bot...")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .persistence(persistence)
+        # Without this, one running analysis blocks every other user's update
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
+    if app.job_queue is None:
+        raise RuntimeError("Job queue not available. Install with: pip install python-telegram-bot[job-queue]")
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("inference", inference))
-    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler(["analizza", "inference"], inference))
+    app.add_handler(CommandHandler(["notifica", "settings"], notify_command))
+    app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("output", output_format))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Job queue for scheduled notifications - no initial job, users set their own schedules
-    job_queue = app.job_queue
-    if job_queue:
-        log.info("✓ Job scheduler ready (users can set notifications via /settings)")
-    else:
-        log.warning("Job queue not available. Install with: pip install python-telegram-bot[job-queue]")
-    
     log.info("✓ Bot running. Waiting for commands...")
     app.run_polling()

@@ -1,13 +1,18 @@
+import logging
+
 import requests
+
+log = logging.getLogger(__name__)
 
 # Coordinate del Poetto di Cagliari
 LAT = 39.194167 
 LON = 9.160833
 
 # Funzione per ottenere il vento
-def get_wind(lat, lon):
+def get_wind(lat: float, lon: float) -> str | None:
     """
-    Restituisce velocità e direzione del vento per le coordinate specificate.
+    Restituisce velocità e direzione del vento per le coordinate specificate,
+    oppure None se i dati non sono disponibili (il bot in quel caso li omette).
     """
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
@@ -30,9 +35,11 @@ def get_wind(lat, lon):
 
             return f"Vento al Poetto: {wind_speed} km/h, Direzione: {direction_text} ({wind_deg}°)"
         else:
-            return "Dati vento non disponibili."
+            log.warning("Open-Meteo response without current_weather")
+            return None
     except requests.RequestException as e:
-        return f"Errore nella richiesta: {e}"
+        log.warning(f"Wind request failed: {e}")
+        return None
 
 # Esempio di utilizzo
 if __name__ == "__main__":
