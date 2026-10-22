@@ -19,7 +19,7 @@ import gdown
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, NetworkError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -36,6 +36,8 @@ from get_wind_info import LAT, LON, get_wind
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
+# httpx logs every request URL at INFO, and Telegram URLs contain the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # TELEGRAM TOKEN
@@ -728,9 +730,7 @@ async def scheduled_inference(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(application: Application) -> None:
-    """Register the command menu and restore daily jobs from persisted chat settings"""
-    await application.bot.set_my_commands(BOT_COMMANDS)
-
+    """Restore daily jobs from persisted chat settings and register the command menu"""
     restored = 0
     for chat_id, chat_data in application.chat_data.items():
         notify_time = chat_data.get("notify_time")
@@ -738,6 +738,12 @@ async def post_init(application: Application) -> None:
             schedule_daily_job(application.job_queue, chat_id, notify_time)
             restored += 1
     log.info(f"Restored {restored} daily notifications from {PERSISTENCE_PATH}")
+
+    # The command menu is a nicety: a slow Telegram API must not stop the bot from starting
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+    except NetworkError as e:
+        log.warning(f"Could not register the command menu: {e}")
 
 
 # MAIN
