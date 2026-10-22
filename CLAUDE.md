@@ -28,6 +28,7 @@ Module-level side effects happen at import: env/token loading, `./temp`, `./data
 
 Analysis pipeline (`analyze_sea`, blocking, run via `asyncio.to_thread` under `analysis_lock` from `run_inference`):
 1. `download_segments` fetches the `M3U8_URL` playlist and downloads the `N_SEGMENTS` most recent `.ts` segments (most recent first) into a per-request `tempfile.TemporaryDirectory` under `./temp`.
+   Before the model, `check_webcam_image` measures brightness and motion on the grayscale ROI of the latest segment. It raises `WebcamUnavailableError` (`dark` / `frozen` / `offline`, thresholds `DARK_BRIGHTNESS_THRESHOLD`, `FROZEN_MOTION_THRESHOLD`). `run_inference` then sends `build_webcam_problem_text` with the Open-Meteo data instead of a prediction.
 2. `load_video` samples `FRAME_COUNT` (16) evenly spaced frames, crops to `ROI` (x1, y1, x2, y2 in source-pixel coords), resizes to 112×112 → tensor shaped `(1, C, T, H, W)`.
 3. `predict_probs` gives softmax probabilities for one segment; `predict` averages them over all segments and returns `(label, confidence, top_class)`, where `label` is `UNCERTAIN_LABEL` when the averaged confidence is below `CONFIDENCE_THRESHOLD`.
 4. The most recent segment becomes a frame (`extract_frame`) or MP4 (`convert_ts_to_mp4`) per chat `output_format`; wind comes from Open-Meteo (`get_wind`, `None` on failure), waves and water temperature from Open-Meteo Marine (`sea_conditions.get_marine_now`). `marine_mismatch_note` warns when the webcam label and the wave estimate clearly disagree.

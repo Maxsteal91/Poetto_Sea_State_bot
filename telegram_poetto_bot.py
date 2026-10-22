@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 from dataclasses import dataclass
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -96,6 +97,11 @@ N_SEGMENTS = 3
 # Below this averaged confidence the result is reported as uncertain
 CONFIDENCE_THRESHOLD = 0.70
 UNCERTAIN_LABEL = "incerto"
+
+# Webcam image checks before running the model, on the grayscale ROI (0-255 scale).
+# Measured 22/10 afternoon, overcast, calm sea: brightness ~88, motion ~1.26; frozen clip: motion ~0.13
+DARK_BRIGHTNESS_THRESHOLD = 35.0  # mean brightness below this: night, the sea is not visible
+FROZEN_MOTION_THRESHOLD = 0.25  # mean difference between sampled frames below this: image not moving
 
 # Random messages
 MESSAGES_CALM = [
@@ -295,6 +301,56 @@ def download_segments(out_dir: str, n_segments: int = N_SEGMENTS) -> list[str]:
     return video_paths
 
 
+class WebcamUnavailableError(Exception):
+    """The webcam can't be analyzed. reason is one of WEBCAM_PROBLEM_MESSAGES keys"""
+
+    def __init__(self, reason: str, details: str):
+        super().__init__(f"{reason}: {details}")
+        self.reason = reason
+
+
+def measure_roi_stats(video_path: str, crop_region=ROI, n_samples: int = FRAME_COUNT) -> tuple[float, float]:
+    """Mean brightness and motion of the grayscale ROI over n_samples evenly spaced frames.
+
+    Motion is the mean absolute difference between consecutive sampled frames.
+    Returns (brightness, motion), both on a 0-255 scale.
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_indices = set(np.linspace(0, total_frames - 1, n_samples).astype(int).tolist())
+    x1, y1, x2, y2 = crop_region
+    gray_frames = []
+    for index in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if index in sample_indices:
+            roi = frame[y1:y2, x1:x2]
+            gray_frames.append(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32))
+    cap.release()
+    if len(gray_frames) < 2:
+        raise WebcamUnavailableError("offline", f"only {len(gray_frames)} readable frames in {video_path}")
+
+    brightness_values = []
+    for gray_frame in gray_frames:
+        brightness_values.append(gray_frame.mean())
+    motion_values = []
+    for previous_frame, next_frame in zip(gray_frames[:-1], gray_frames[1:]):
+        motion_values.append(np.abs(next_frame - previous_frame).mean())
+    return float(np.mean(brightness_values)), float(np.mean(motion_values))
+
+
+def check_webcam_image(video_path: str) -> None:
+    """Raise WebcamUnavailableError if the image is too dark or not moving (frozen camera)"""
+    brightness, motion = measure_roi_stats(video_path)
+    log.info(f"Webcam image {video_path}: brightness={brightness:.1f}, motion={motion:.2f}")
+    # Dark first: a night image barely moves too
+    if brightness < DARK_BRIGHTNESS_THRESHOLD:
+        raise WebcamUnavailableError("dark", f"brightness {brightness:.1f} < {DARK_BRIGHTNESS_THRESHOLD}")
+    if motion < FROZEN_MOTION_THRESHOLD:
+        raise WebcamUnavailableError("frozen", f"motion {motion:.2f} < {FROZEN_MOTION_THRESHOLD}")
+
+
 def load_video(video_path, frames_per_clip=FRAME_COUNT, crop_region=ROI):
     """Load and preprocess video for model inference"""
     cap = cv2.VideoCapture(video_path)
@@ -456,11 +512,14 @@ def keep_clips_for_feedback(
 def analyze_sea(work_dir: str, output_format: str) -> SeaAnalysis:
     """Download recent segments into work_dir, run the model and prepare the media to send.
 
-    Raises RuntimeError if the download or the media preparation fails.
+    Raises WebcamUnavailableError if the stream is down or the image is dark/frozen,
+    RuntimeError if the media preparation fails.
     """
     video_paths = download_segments(work_dir)
     if not video_paths:
-        raise RuntimeError("Failed to download video segments")
+        raise WebcamUnavailableError("offline", "no segment could be downloaded")
+    # No point running the model on a night or frozen image
+    check_webcam_image(video_paths[0])
 
     label, confidence, top_class = predict(video_paths)
 
@@ -544,6 +603,30 @@ def build_caption(analysis: SeaAnalysis, scheduled_time: str | None = None) -> s
     lines += ["", random_msg]
     if analysis.feedback_id:
         lines += ["", "👇 Secondo te com'è il mare nel video? Il tuo voto aiuta a migliorare il bot"]
+    if scheduled_time:
+        lines += ["", f"⏰ Notifica giornaliera delle {scheduled_time} · /stop per disattivarla"]
+    return "\n".join(lines)
+
+
+WEBCAM_PROBLEM_MESSAGES = {
+    "dark": "🌙 <b>È buio</b>: la webcam non mostra il mare. Riprova quando c'è luce!",
+    "frozen": "🧊 <b>La webcam sembra bloccata</b>: l'immagine non si muove, non posso analizzare il mare.",
+    "offline": "📵 <b>La webcam del Poetto non è raggiungibile</b> al momento. Riprova tra un po'.",
+}
+
+
+def build_webcam_problem_text(
+    reason: str, marine: MarineNow | None, wind_text: str | None, scheduled_time: str | None = None
+) -> str:
+    """HTML message when the webcam can't be analyzed, with the Open-Meteo data as a fallback"""
+    lines = ["🌊 <b>Spiaggia del Poetto - Cagliari</b>", "", WEBCAM_PROBLEM_MESSAGES[reason]]
+    if marine or wind_text:
+        lines += ["", "Intanto, dalle stime meteo-marine:"]
+    if marine:
+        lines.append(format_marine_now(marine))
+    if wind_text:
+        lines.append(f"💨 {wind_text}")
+    lines += ["", "🔮 Previsioni per le prossime ore: /previsioni"]
     if scheduled_time:
         lines += ["", f"⏰ Notifica giornaliera delle {scheduled_time} · /stop per disattivarla"]
     return "\n".join(lines)
@@ -851,6 +934,16 @@ async def send_analysis(
             )
 
 
+async def send_webcam_problem(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str, scheduled_time: str | None
+) -> None:
+    """Tell the user the webcam can't be analyzed, with waves/wind from Open-Meteo instead"""
+    marine = await asyncio.to_thread(get_marine_now, LAT, LON)
+    wind_text = await asyncio.to_thread(get_wind, LAT, LON)
+    text = build_webcam_problem_text(reason, marine, wind_text, scheduled_time)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+
 async def run_inference(context: ContextTypes.DEFAULT_TYPE, chat_id: int, scheduled_time: str | None = None) -> None:
     """Run the full analysis for a chat and send the result"""
     if chat_id in chats_in_progress:
@@ -870,6 +963,9 @@ async def run_inference(context: ContextTypes.DEFAULT_TYPE, chat_id: int, schedu
                 analysis = await asyncio.to_thread(analyze_sea, work_dir, settings["output_format"])
             log.info(f"Chat {chat_id}: {analysis.label} ({analysis.confidence * 100:.1f}%)")
             await send_analysis(context, chat_id, analysis, scheduled_time)
+    except WebcamUnavailableError as e:
+        log.warning(f"Chat {chat_id}: webcam not usable ({e})")
+        await send_webcam_problem(context, chat_id, e.reason, scheduled_time)
     except Forbidden:
         # The user blocked the bot: stop sending daily notifications
         log.warning(f"Chat {chat_id} blocked the bot, disabling its daily notification")
