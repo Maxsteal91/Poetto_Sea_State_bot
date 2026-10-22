@@ -81,6 +81,9 @@ MODEL_PATH = os.path.join(MODEL_DIR, "r3d_18_poetto.pth")
 MODEL_GDRIVE_ID = "1ASd7VdbSrXXs9fa3EpHFed0W2NlUugq9"
 TIMEOUT = 15
 RETRIES = 2
+# Telegram can take well over the PTB default (5 s) to acknowledge a photo/video upload
+TELEGRAM_READ_TIMEOUT = 15
+TELEGRAM_MEDIA_TIMEOUT = 60
 
 FRAME_COUNT = 16
 ROI = (430, 600, 430 + 1400, 600 + 350)
@@ -834,6 +837,8 @@ async def send_analysis(
                 caption=caption,
                 parse_mode="HTML",
                 reply_markup=result_keyboard(analysis.feedback_id),
+                read_timeout=TELEGRAM_MEDIA_TIMEOUT,
+                write_timeout=TELEGRAM_MEDIA_TIMEOUT,
             )
         else:
             await context.bot.send_video(
@@ -843,6 +848,8 @@ async def send_analysis(
                 parse_mode="HTML",
                 supports_streaming=True,
                 reply_markup=result_keyboard(analysis.feedback_id),
+                read_timeout=TELEGRAM_MEDIA_TIMEOUT,
+                write_timeout=TELEGRAM_MEDIA_TIMEOUT,
             )
 
 
@@ -934,6 +941,7 @@ if __name__ == "__main__":
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .persistence(persistence)
+        .read_timeout(TELEGRAM_READ_TIMEOUT)
         # Without this, one running analysis blocks every other user's update
         .concurrent_updates(True)
         .post_init(post_init)
